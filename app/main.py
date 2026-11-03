@@ -18,7 +18,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from app.api import router
-from app.audit import AuditStore, create_engine
 from app.limits import ProviderABudget, RedisGate, open_redis
 from app.providers import ProviderCallError, ProviderClient, build_client
 from app.resilience import Admission, Breaker
@@ -69,7 +68,6 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     clients: list[httpx.AsyncClient] = []
     gate: RedisGate | None = None
-    audit: AuditStore | None = None
     try:
         upstreams: list[Upstream] = []
         for name, url in (
@@ -98,9 +96,6 @@ async def lifespan(app: FastAPI):
         gate = RedisGate(open_redis(settings.redis_url), settings)
         app.state.gate = gate
         await gate.ping()
-        audit = AuditStore(create_engine(settings.database_url))
-        app.state.audit = audit
-        await audit.ping()
         app.state.router = Router(
             upstreams,
             deadline_seconds=settings.deadline_seconds,
@@ -116,9 +111,6 @@ async def lifespan(app: FastAPI):
         if gate is not None:
             await gate.aclose()
             logger.info("redis closed")
-        if audit is not None:
-            await audit.aclose()
-            logger.info("postgres closed")
 
 
 def _error_response(

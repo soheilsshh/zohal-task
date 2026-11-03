@@ -1,20 +1,18 @@
 """Narrow audit row for one handled request.
 
-Moved to the worker in phase 8. The insert stays on the request path
-so the row is visible in psql before the response is sent. The body is
-not stored here.
+The API publishes the row. The Celery worker inserts it. A duplicate
+``trace_id`` is ignored, so a redelivered message does not create a
+second row. The body is not stored here.
 """
 
 import logging
 import time
 from datetime import datetime
-from urllib.parse import urlparse
 
 from fastapi.responses import JSONResponse
-from sqlalchemy import DateTime, Float, Integer, String, text
+from sqlalchemy import DateTime, Float, Integer, String, create_engine
 from sqlalchemy.dialects.postgresql import JSONB, insert
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 logger = logging.getLogger("gateway")
 
@@ -38,17 +36,66 @@ class AuditRequest(Base):
     error_class: Mapped[str | None] = mapped_column(String(64))
 
 
-def create_engine(url: str) -> AsyncEngine:
-    return create_async_engine(url, pool_size=5, max_overflow=5, pool_pre_ping=True)
+def create_sync_engine(url: str):
+    """Engine for the worker. The API process does not open one."""
+    return create_engine(url, pool_size=2, max_overflow=0, pool_pre_ping=True)
 
 
-def database_target(url: str) -> str:
-    """Host, port, and database name. The URL may carry a password."""
-    parsed = urlparse(url)
-    host = parsed.hostname or "unknown"
-    port = parsed.port or 5432
-    name = parsed.path.lstrip("/") or "unknown"
-    return f"{host}:{port}/{name}"
+def audit_message(
+    *,
+    trace_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+    provider: str | None,
+    final_status: int,
+    latency_ms: float,
+    attempts: list[dict],
+    error_class: str | None,
+) -> dict:
+    """JSON-safe payload. The worker is a different process and cannot share objects."""
+    return {
+        "trace_id": trace_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "provider": provider,
+        "final_status": final_status,
+        "latency_ms": round(latency_ms, 1),
+        "attempts": attempts,
+        "error_class": error_class,
+    }
+
+
+def insert_audit_row(engine, message: dict) -> None:
+    """Insert one row and commit. The caller retries when this raises.
+
+    ``ON CONFLICT DO NOTHING`` makes a second delivery of the same trace id a success.
+    """
+    started = time.perf_counter()
+    statement = (
+        insert(AuditRequest)
+        .values(
+            trace_id=message["trace_id"],
+            started_at=datetime.fromisoformat(message["started_at"]),
+            finished_at=datetime.fromisoformat(message["finished_at"]),
+            provider=message["provider"],
+            final_status=message["final_status"],
+            latency_ms=message["latency_ms"],
+            attempts=message["attempts"],
+            error_class=message["error_class"],
+        )
+        .on_conflict_do_nothing(index_elements=["trace_id"])
+    )
+    with Session(engine) as session:
+        session.execute(statement)
+        session.commit()
+    logger.info(
+        "audit_insert trace_id=%s status=%s provider=%s latency_ms=%s insert_ms=%.1f",
+        message["trace_id"],
+        message["final_status"],
+        message["provider"] or "-",
+        message["latency_ms"],
+        (time.perf_counter() - started) * 1000,
+    )
 
 
 def provider_of(trail: list[dict], response: JSONResponse | None) -> str | None:
@@ -84,66 +131,3 @@ def _body(response: JSONResponse | None) -> object:
         return json.loads(response.body)
     except (ValueError, TypeError):
         return None
-
-
-class AuditStore:
-    def __init__(self, engine: AsyncEngine) -> None:
-        self._engine = engine
-        self._sessions = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-
-    async def ping(self) -> None:
-        try:
-            async with self._engine.connect() as connection:
-                await connection.execute(text("SELECT 1"))
-        except Exception as exc:
-            logger.error("postgres_unavailable error=%s", type(exc).__name__)
-            return
-        logger.info("postgres opened")
-
-    async def record(
-        self,
-        *,
-        trace_id: str,
-        started_at: datetime,
-        finished_at: datetime,
-        provider: str | None,
-        final_status: int,
-        latency_ms: float,
-        attempts: list[dict],
-        error_class: str | None,
-        database_url: str,
-    ) -> None:
-        """Insert one row. A duplicate trace id is ignored.
-
-        Moved to the worker in phase 8.
-        """
-        started = time.perf_counter()
-        statement = insert(AuditRequest).values(
-            trace_id=trace_id,
-            started_at=started_at,
-            finished_at=finished_at,
-            provider=provider,
-            final_status=final_status,
-            latency_ms=round(latency_ms, 1),
-            attempts=attempts,
-            error_class=error_class,
-        ).on_conflict_do_nothing(index_elements=["trace_id"])
-        try:
-            async with self._sessions() as session:
-                await session.execute(statement)
-                await session.commit()
-        except Exception as exc:
-            logger.error("audit_insert_failed trace_id=%s error=%s", trace_id, type(exc).__name__)
-            return
-        logger.info(
-            "audit_insert trace_id=%s status=%s provider=%s latency_ms=%.1f insert_ms=%.1f target=%s",
-            trace_id,
-            final_status,
-            provider or "-",
-            latency_ms,
-            (time.perf_counter() - started) * 1000,
-            database_target(database_url),
-        )
-
-    async def aclose(self) -> None:
-        await self._engine.dispose()

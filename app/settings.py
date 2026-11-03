@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # The password is the local development password, the same one
     # postgres is started with. It is not a production secret.
     database_url: str = "postgresql+asyncpg://zohal:zohal@postgres:5432/zohal"
+    # The worker is synchronous. It does not share the API's async engine.
+    database_url_sync: str = "postgresql+psycopg://zohal:zohal@postgres:5432/zohal"
+    # Not guest. RabbitMQ refuses the guest user from another container.
+    celery_broker_url: str = "amqp://zohal:zohal@rabbitmq:5672//"
 
 
 @lru_cache(maxsize=1)

@@ -4,6 +4,7 @@
 This module only decides what each route returns.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -13,12 +14,13 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from app.audit import error_class_of, provider_of
+from app.audit import audit_message, error_class_of, provider_of
 from app.idempotency import IdempotencyInProgress, InvalidIdempotencyKey, normalize_key, once
 from app.limits import RedisGate
 from app.providers import ProviderCallError
 from app.routing import Router
 from app.schemas import ErrorResponse, ProcessRequest, ProviderResult
+from app.tasks import publish_audit
 
 logger = logging.getLogger("gateway")
 
@@ -74,9 +76,10 @@ async def process(
 ) -> JSONResponse:
     """Prefer A when its bucket has a token. One failover may try B or C.
 
-    The audit insert runs before the response is sent. Phase 8 moves
-    that insert off this path. The same ``Idempotency-Key`` returns the
-    stored response and does not call a provider.
+    The audit message is published before the response is sent. The
+    worker inserts the row. This request does not wait for PostgreSQL.
+    The same ``Idempotency-Key`` returns the stored response and does
+    not call a provider.
     """
     trace_id = request.state.trace_id
     started_at = datetime.now(timezone.utc)
@@ -134,8 +137,7 @@ async def process(
         raised = exc.error
         raise
     finally:
-        settings = request.app.state.settings
-        await request.app.state.audit.record(
+        message = audit_message(
             trace_id=trace_id,
             started_at=started_at,
             finished_at=datetime.now(timezone.utc),
@@ -144,8 +146,15 @@ async def process(
             latency_ms=(time.perf_counter() - started) * 1000,
             attempts=list(trail),
             error_class=error_class_of(status, response, raised),
-            database_url=settings.database_url,
         )
+        try:
+            await asyncio.to_thread(publish_audit, message)
+        except Exception as exc:
+            logger.error(
+                "audit_publish_failed trace_id=%s error=%s",
+                trace_id,
+                type(exc).__name__,
+            )
 
 
 def _client_identity(client_id: str | None, host: str | None) -> str:

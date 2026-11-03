@@ -27,16 +27,36 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    # zohal, not guest. Guest is refused from another container.
+    # The management UI is http://127.0.0.1:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: zohal
+      RABBITMQ_DEFAULT_PASS: zohal
+    ports:
+      - "15672:15672"
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-celery.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
   api:
     build:
       context: .
       dockerfile: Dockerfile
+    image: zohal-gateway
     ports:
       - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     environment:
       # Docker Desktop on Windows often does not deliver file events from a
@@ -66,6 +86,26 @@ services:
       timeout: 3s
       retries: 3
       start_period: 20s
+  worker:
+    image: zohal-gateway
+    # Same image as the API. This process is the only place the audit insert runs.
+    # Do not start it from PowerShell. Celery on Windows is not this project's worker.
+    command:
+      - celery
+      - -A
+      - app.celery_app:celery
+      - worker
+      - --loglevel=info
+      - --concurrency=1
+    volumes:
+      - ./app:/srv/app/app
+    depends_on:
+      api:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
 
 volumes:
   pgdata:
