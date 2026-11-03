@@ -11,6 +11,10 @@ services:
       WATCHFILES_FORCE_POLLING: "true"
     volumes:
       - ./app:/srv/app/app
+      # Mounted file, not compose env_file. A reloader starts a new
+      # process, which re-reads this file. Variables injected by Compose
+      # would stay stale across that reload and hide the edit.
+      - ./.env:/srv/app/.env:ro
     # Dev command. The image CMD serves without a reloader.
     command:
       - uvicorn
@@ -21,7 +25,11 @@ services:
       - "8000"
       - --reload
       - --reload-dir
-      - /srv/app/app
+      - /srv/app
+      # Default watching is *.py. The env file has to be named or a
+      # save there never restarts the process.
+      - --reload-include
+      - .env
     healthcheck:
       test:
         - CMD
