@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     idempotency_ttl_seconds: int = 86400
     idempotency_pending_seconds: int = 30
 
+    # Inside Compose the hostname is the service name, not localhost.
+    # The password is the local development password, the same one
+    # postgres is started with. It is not a production secret.
+    database_url: str = "postgresql+asyncpg://zohal:zohal@postgres:5432/zohal"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

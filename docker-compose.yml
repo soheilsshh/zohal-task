@@ -11,6 +11,22 @@ services:
       timeout: 3s
       retries: 10
       start_period: 2s
+  postgres:
+    image: postgres:16-alpine
+    # The API reaches this process as the hostname postgres.
+    # The password matches the default DATABASE_URL in app/settings.py.
+    environment:
+      POSTGRES_USER: zohal
+      POSTGRES_PASSWORD: zohal
+      POSTGRES_DB: zohal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zohal -d zohal"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
   api:
     build:
       context: .
@@ -20,31 +36,26 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       # Docker Desktop on Windows often does not deliver file events from a
       # bind mount. Polling is what makes --reload see a save.
       WATCHFILES_FORCE_POLLING: "true"
     volumes:
       - ./app:/srv/app/app
+      - ./alembic:/srv/app/alembic:ro
+      - ./alembic.ini:/srv/app/alembic.ini:ro
       # Mounted file, not compose env_file. A reloader starts a new
       # process, which re-reads this file. Variables injected by Compose
       # would stay stale across that reload and hide the edit.
       - ./.env:/srv/app/.env:ro
-    # Dev command. The image CMD serves without a reloader.
+    # Migrate, then serve. A second start runs the same upgrade and
+    # changes nothing once the table exists. Reload does not migrate again.
     command:
-      - uvicorn
-      - app.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --reload
-      - --reload-dir
-      - /srv/app
-      # Default watching is *.py. The env file has to be named or a
-      # save there never restarts the process.
-      - --reload-include
-      - .env
+      - sh
+      - -c
+      - alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /srv/app --reload-include .env
     healthcheck:
       test:
         - CMD
@@ -54,4 +65,7 @@ services:
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 20s
+
+volumes:
+  pgdata:

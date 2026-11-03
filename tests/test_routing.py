@@ -158,6 +158,20 @@ async def test_b_starts_only_after_a_has_finished() -> None:
     assert seen == [0]
 
 
+async def test_failover_records_both_attempts() -> None:
+    a, b, c = Scripted("a", [429]), Scripted("b", [200]), Scripted("c", [200])
+    router, _ = make_router(a, b, c)
+    trail: list[dict] = []
+
+    response = await router.execute({}, "trace-audit", trail)
+
+    assert body_of(response)["provider"] == "b"
+    assert [item["provider"] for item in trail] == ["a", "b"]
+    assert trail[0]["status"] == 429 and trail[0]["error"] is None
+    assert trail[1]["status"] == 200 and trail[1]["error"] is None
+    assert trail[0]["latency_ms"] >= 0
+
+
 class _Budget:
     def __init__(self, decision: str) -> None:
         self._decision = decision

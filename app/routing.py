@@ -132,7 +132,12 @@ class Router:
                 return candidate
         return None
 
-    async def execute(self, body: dict[str, Any], trace_id: str) -> JSONResponse:
+    async def execute(
+        self,
+        body: dict[str, Any],
+        trace_id: str,
+        trail: list[dict[str, Any]] | None = None,
+    ) -> JSONResponse:
         if self._admission is not None:
             try:
                 self._admission.enter()
@@ -144,12 +149,17 @@ class Router:
                 )
                 raise
         try:
-            return await self._attempt(body, trace_id)
+            return await self._attempt(body, trace_id, trail)
         finally:
             if self._admission is not None:
                 self._admission.leave()
 
-    async def _attempt(self, body: dict[str, Any], trace_id: str) -> JSONResponse:
+    async def _attempt(
+        self,
+        body: dict[str, Any],
+        trace_id: str,
+        trail: list[dict[str, Any]] | None = None,
+    ) -> JSONResponse:
         deadline = time.monotonic() + self._deadline
         excluded: set[str] = set()
         last_response: JSONResponse | None = None
@@ -187,6 +197,7 @@ class Router:
                 remaining * 1000,
                 upstream.inflight,
             )
+            call_started = time.perf_counter()
             try:
                 response = await upstream.call(body, trace_id, remaining)
             except ProviderCallError as exc:
@@ -194,6 +205,7 @@ class Router:
                     excluded.add(upstream.name)
                     logger.info("circuit_open trace_id=%s provider=%s", trace_id, upstream.name)
                     continue
+                _remember(trail, upstream.name, None, exc.error, call_started)
                 last_error = exc
                 attempt += 1
                 if attempt == 1 and exc.error in FAILOVER_ERRORS:
@@ -206,6 +218,7 @@ class Router:
                     )
                     continue
                 break
+            _remember(trail, upstream.name, response.status_code, None, call_started)
             attempt += 1
             if attempt == 1 and response.status_code in FAILOVER_STATUSES:
                 excluded.add(upstream.name)
@@ -224,6 +237,25 @@ class Router:
         if last_response is not None:
             return last_response
         raise ProviderCallError("upstream_unavailable", 503, retry_after=1)
+
+
+def _remember(
+    trail: list[dict[str, Any]] | None,
+    provider: str,
+    status: int | None,
+    error: str | None,
+    started: float,
+) -> None:
+    if trail is None:
+        return
+    trail.append(
+        {
+            "provider": provider,
+            "status": status,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "error": error,
+        }
+    )
 
 
 def _capped(timeout: httpx.Timeout, budget: float) -> httpx.Timeout:

@@ -6,13 +6,17 @@ This module only decides what each route returns.
 
 import logging
 import re
+import time
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from app.audit import error_class_of, provider_of
 from app.idempotency import IdempotencyInProgress, InvalidIdempotencyKey, normalize_key, once
 from app.limits import RedisGate
+from app.providers import ProviderCallError
 from app.routing import Router
 from app.schemas import ErrorResponse, ProcessRequest, ProviderResult
 
@@ -70,40 +74,78 @@ async def process(
 ) -> JSONResponse:
     """Prefer A when its bucket has a token. One failover may try B or C.
 
-    The same ``Idempotency-Key`` returns the first response. Redis
-    errors on the bucket, the inbound counter, or the key reject the
-    call before a provider is contacted.
+    The audit insert runs before the response is sent. Phase 8 moves
+    that insert off this path. The same ``Idempotency-Key`` returns the
+    stored response and does not call a provider.
     """
     trace_id = request.state.trace_id
+    started_at = datetime.now(timezone.utc)
+    started = time.perf_counter()
+    trail: list[dict] = []
+    status = 500
+    raised: str | None = None
+    response: JSONResponse | None = None
     try:
-        key = normalize_key(idempotency_key)
-    except InvalidIdempotencyKey:
-        payload = ErrorResponse(trace_id=trace_id, error="invalid_idempotency_key")
-        return JSONResponse(status_code=422, content=payload.model_dump())
+        try:
+            key = normalize_key(idempotency_key)
+        except InvalidIdempotencyKey:
+            status = 422
+            raised = "invalid_idempotency_key"
+            response = JSONResponse(
+                status_code=422,
+                content=ErrorResponse(trace_id=trace_id, error=raised).model_dump(),
+            )
+            return response
 
-    gate: RedisGate = request.app.state.gate
-    host = request.client.host if request.client is not None else None
-    identity = _client_identity(x_client_id, host)
-    if not await gate.allow_inbound(identity):
-        logger.info("inbound_limited trace_id=%s client=%s", trace_id, identity)
-        payload = ErrorResponse(trace_id=trace_id, error="rate_limited")
-        retry_after = request.app.state.settings.inbound_window_seconds
-        return JSONResponse(
-            status_code=429,
-            content=payload.model_dump(),
-            headers={"Retry-After": str(retry_after)},
+        gate: RedisGate = request.app.state.gate
+        host = request.client.host if request.client is not None else None
+        identity = _client_identity(x_client_id, host)
+        if not await gate.allow_inbound(identity):
+            status = 429
+            raised = "rate_limited"
+            logger.info("inbound_limited trace_id=%s client=%s", trace_id, identity)
+            retry_after = request.app.state.settings.inbound_window_seconds
+            response = JSONResponse(
+                status_code=429,
+                content=ErrorResponse(trace_id=trace_id, error=raised).model_dump(),
+                headers={"Retry-After": str(retry_after)},
+            )
+            return response
+
+        gateway: Router = request.app.state.router
+
+        async def call() -> JSONResponse:
+            return await gateway.execute(body.model_dump(exclude_none=True), trace_id, trail)
+
+        try:
+            response = await once(gate, key, trace_id, call)
+        except IdempotencyInProgress:
+            status = 409
+            raised = "idempotency_in_progress"
+            response = JSONResponse(
+                status_code=409,
+                content=ErrorResponse(trace_id=trace_id, error=raised).model_dump(),
+            )
+            return response
+        status = response.status_code
+        return response
+    except ProviderCallError as exc:
+        status = exc.status_code
+        raised = exc.error
+        raise
+    finally:
+        settings = request.app.state.settings
+        await request.app.state.audit.record(
+            trace_id=trace_id,
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+            provider=provider_of(trail, response),
+            final_status=status,
+            latency_ms=(time.perf_counter() - started) * 1000,
+            attempts=list(trail),
+            error_class=error_class_of(status, response, raised),
+            database_url=settings.database_url,
         )
-
-    gateway: Router = request.app.state.router
-
-    async def call() -> JSONResponse:
-        return await gateway.execute(body.model_dump(exclude_none=True), trace_id)
-
-    try:
-        return await once(gate, key, trace_id, call)
-    except IdempotencyInProgress:
-        payload = ErrorResponse(trace_id=trace_id, error="idempotency_in_progress")
-        return JSONResponse(status_code=409, content=payload.model_dump())
 
 
 def _client_identity(client_id: str | None, host: str | None) -> str:
