@@ -1,8 +1,9 @@
 """Process settings.
 
 Environment variables override the env file. The env file overrides
-the defaults below. Provider A is called from this process.
-B and C are loaded so the names exist, and nothing calls them yet.
+the defaults below. A call prefers provider A. One failure on the
+failover list may try B or C inside the deadline. Nothing calls all
+three at once.
 """
 
 from functools import lru_cache
@@ -28,6 +29,25 @@ class Settings(BaseSettings):
     provider_a_read_timeout_seconds: float = 1.5
     provider_a_write_timeout_seconds: float = 1.0
     provider_a_pool_timeout_seconds: float = 0.5
+
+    # B and C may take up to 10 s. The read timeout is the per-call cap;
+    # the deadline below still cancels the attempt earlier.
+    provider_b_connect_timeout_seconds: float = 1.0
+    provider_b_read_timeout_seconds: float = 3.0
+    provider_b_write_timeout_seconds: float = 1.0
+    provider_b_pool_timeout_seconds: float = 0.5
+    provider_c_connect_timeout_seconds: float = 1.0
+    provider_c_read_timeout_seconds: float = 3.0
+    provider_c_write_timeout_seconds: float = 1.0
+    provider_c_pool_timeout_seconds: float = 0.5
+
+    deadline_seconds: float = 3.0
+    min_attempt_seconds: float = 0.05
+
+    # Per process, not per fleet. See app/routing.py.
+    provider_a_max_inflight: int = 100
+    provider_b_max_inflight: int = 20
+    provider_c_max_inflight: int = 20
 
 
 @lru_cache(maxsize=1)

@@ -19,6 +19,7 @@ from starlette.responses import Response
 
 from app.api import router
 from app.providers import ProviderCallError, ProviderClient, build_client
+from app.routing import Router, Upstream
 from app.schemas import ErrorResponse, ValidationDetail
 from app.settings import get_settings
 
@@ -63,24 +64,35 @@ async def lifespan(app: FastAPI):
     _configure_logging()
     settings = get_settings()
     app.state.settings = settings
-    timeout = httpx.Timeout(
-        connect=settings.provider_a_connect_timeout_seconds,
-        read=settings.provider_a_read_timeout_seconds,
-        write=settings.provider_a_write_timeout_seconds,
-        pool=settings.provider_a_pool_timeout_seconds,
-    )
-    client = build_client(timeout)
-    app.state.provider_a = ProviderClient(client, str(settings.provider_a_url))
-    logger.info(
-        "provider client opened name=a id=%s url=%s",
-        id(client),
-        settings.provider_a_url,
+    clients: list[httpx.AsyncClient] = []
+    upstreams: list[Upstream] = []
+    for name, url in (
+        ("a", settings.provider_a_url),
+        ("b", settings.provider_b_url),
+        ("c", settings.provider_c_url),
+    ):
+        timeout = _provider_timeout(settings, name)
+        client = build_client(timeout)
+        clients.append(client)
+        upstreams.append(
+            Upstream(
+                ProviderClient(client, str(url), name=name),
+                max_inflight=getattr(settings, f"provider_{name}_max_inflight"),
+                timeout=timeout,
+            )
+        )
+        logger.info("provider client opened name=%s id=%s url=%s", name, id(client), url)
+    app.state.router = Router(
+        upstreams,
+        deadline_seconds=settings.deadline_seconds,
+        min_attempt_seconds=settings.min_attempt_seconds,
     )
     try:
         yield
     finally:
-        await client.aclose()
-        logger.info("provider client closed name=a id=%s", id(client))
+        for client in clients:
+            await client.aclose()
+            logger.info("provider client closed id=%s", id(client))
 
 
 def _error_response(status_code: int, payload: ErrorResponse) -> JSONResponse:
@@ -93,7 +105,7 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description=(
             "Synchronous gateway. Swagger UI is this page. "
-            "POST /v1/process currently calls provider A only."
+            "POST /v1/process prefers provider A and may fail over once."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -158,3 +170,12 @@ def _trace_id_from(request: Request) -> str:
 
 
 app = create_app()
+
+
+def _provider_timeout(settings: object, name: str) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=getattr(settings, f"provider_{name}_connect_timeout_seconds"),
+        read=getattr(settings, f"provider_{name}_read_timeout_seconds"),
+        write=getattr(settings, f"provider_{name}_write_timeout_seconds"),
+        pool=getattr(settings, f"provider_{name}_pool_timeout_seconds"),
+    )

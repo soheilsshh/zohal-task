@@ -39,13 +39,19 @@ class ProviderClient:
         self._url = url
         self.name = name
 
-    async def process(self, body: dict[str, Any], trace_id: str) -> JSONResponse:
+    async def process(
+        self,
+        body: dict[str, Any],
+        trace_id: str,
+        timeout: httpx.Timeout | None = None,
+    ) -> JSONResponse:
         started = time.perf_counter()
         try:
             response = await self._client.post(
                 self._url,
                 json=body,
                 headers={"X-Request-ID": trace_id},
+                timeout=timeout,
             )
         except httpx.TimeoutException as exc:
             self._log(trace_id, "timeout", started, error=type(exc).__name__)
