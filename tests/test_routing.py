@@ -43,12 +43,15 @@ def make_router(
     deadline: float = 3.0,
     caps: tuple[int, int, int] = (100, 100, 100),
     budget: object | None = None,
+    breakers: tuple[object | None, object | None, object | None] = (None, None, None),
+    admission: object | None = None,
 ) -> tuple[Router, list[Upstream]]:
     timeout = httpx.Timeout(1.0)
     upstreams = [
-        Upstream(client, cap, timeout) for client, cap in zip((a, b, c), caps, strict=True)
+        Upstream(client, cap, timeout, breaker=breaker)
+        for client, cap, breaker in zip((a, b, c), caps, breakers, strict=True)
     ]
-    return Router(upstreams, deadline, min_attempt_seconds=0.05, budget=budget), upstreams
+    return Router(upstreams, deadline, min_attempt_seconds=0.05, budget=budget, admission=admission), upstreams
 
 
 def body_of(response: JSONResponse) -> dict:

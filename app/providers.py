@@ -14,12 +14,6 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("gateway")
 
-_LIMITS = httpx.Limits(
-    max_connections=50,
-    max_keepalive_connections=20,
-    keepalive_expiry=30.0,
-)
-
 
 class ProviderCallError(Exception):
     """The provider was not reached, or its body was not JSON.
@@ -28,9 +22,10 @@ class ProviderCallError(Exception):
     this error. That response is returned to the caller as-is.
     """
 
-    def __init__(self, error: str, status_code: int) -> None:
+    def __init__(self, error: str, status_code: int, retry_after: int | None = None) -> None:
         self.error = error
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 class ProviderClient:
@@ -84,8 +79,16 @@ class ProviderClient:
         )
 
 
-def build_client(timeout: httpx.Timeout) -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=timeout, limits=_LIMITS)
+def build_client(timeout: httpx.Timeout, max_connections: int) -> httpx.AsyncClient:
+    """The pool matches the in-flight cap so a full bulkhead does not queue inside httpx."""
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=min(20, max_connections),
+            keepalive_expiry=30.0,
+        ),
+    )
 
 
 def _json_response(response: httpx.Response) -> JSONResponse:

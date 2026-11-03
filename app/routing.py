@@ -1,8 +1,10 @@
 """Choose a provider and allow one failover inside a deadline.
 
-In-flight caps live on this object. They are per process: another
-Uvicorn worker or another container has its own counters. The shared
-limit is the Redis token bucket, and it is asked before A is called.
+In-flight caps and circuit breakers live on this object. They are per
+process: another worker or another container has its own. The shared
+limit is the Redis token bucket, asked before A is called. A provider
+is eligible when its circuit admits it, its bulkhead has a free slot,
+and, for A, the bucket has a token.
 """
 
 import asyncio
@@ -14,6 +16,7 @@ import httpx
 from fastapi.responses import JSONResponse
 
 from app.providers import ProviderCallError
+from app.resilience import Admission, Breaker
 
 logger = logging.getLogger("gateway")
 
@@ -48,25 +51,34 @@ class Upstream:
         client: UpstreamCall,
         max_inflight: int,
         timeout: httpx.Timeout,
+        breaker: Breaker | None = None,
     ) -> None:
         self.client = client
         self.name = client.name
         self.max_inflight = max_inflight
         self.timeout = timeout
+        self.breaker = breaker if breaker is not None else Breaker(client.name)
         self.inflight = 0
 
     @property
     def has_capacity(self) -> bool:
         return self.inflight < self.max_inflight
 
+    def eligible(self, excluded: set[str]) -> bool:
+        return self.name not in excluded and self.has_capacity and self.breaker.admits()
+
     async def call(self, body: dict[str, Any], trace_id: str, budget: float) -> JSONResponse:
         if not self.has_capacity:
             raise ProviderCallError("upstream_saturated", 503)
+        if not self.breaker.acquire():
+            raise ProviderCallError("circuit_open", 503)
         self.inflight += 1
         started = time.perf_counter()
+        status_code: int | None = None
+        error: str | None = None
         try:
             try:
-                return await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     self.client.process(body, trace_id, timeout=_capped(self.timeout, budget)),
                     timeout=budget,
                 )
@@ -77,9 +89,17 @@ class Upstream:
                     self.name,
                     (time.perf_counter() - started) * 1000,
                 )
+                error = "upstream_timeout"
                 raise ProviderCallError("upstream_timeout", 504) from exc
+            status_code = response.status_code
+            return response
+        except ProviderCallError as exc:
+            if error is None:
+                error = exc.error
+            raise
         finally:
             self.inflight -= 1
+            self.breaker.observe(status_code, error)
 
 
 class Router:
@@ -89,6 +109,7 @@ class Router:
         deadline_seconds: float,
         min_attempt_seconds: float,
         budget: OutboundBudget | None = None,
+        admission: Admission | None = None,
     ) -> None:
         by_name = {upstream.name: upstream for upstream in upstreams}
         self._a = by_name["a"]
@@ -97,20 +118,38 @@ class Router:
         self._deadline = deadline_seconds
         self._min_attempt = min_attempt_seconds
         self._budget = budget
+        self._admission = admission
         self._prefer_b = True
 
     def choose(self, excluded: set[str]) -> Upstream | None:
         """Prefer A. Otherwise alternate B and C so neither stays idle."""
-        if "a" not in excluded and self._a.has_capacity:
+        if self._a.eligible(excluded):
             return self._a
         order = (self._b, self._c) if self._prefer_b else (self._c, self._b)
         for candidate in order:
-            if candidate.name not in excluded and candidate.has_capacity:
+            if candidate.eligible(excluded):
                 self._prefer_b = candidate is self._c
                 return candidate
         return None
 
     async def execute(self, body: dict[str, Any], trace_id: str) -> JSONResponse:
+        if self._admission is not None:
+            try:
+                self._admission.enter()
+            except ProviderCallError:
+                logger.info(
+                    "admission_rejected trace_id=%s inflight=%s",
+                    trace_id,
+                    self._admission.inflight,
+                )
+                raise
+        try:
+            return await self._attempt(body, trace_id)
+        finally:
+            if self._admission is not None:
+                self._admission.leave()
+
+    async def _attempt(self, body: dict[str, Any], trace_id: str) -> JSONResponse:
         deadline = time.monotonic() + self._deadline
         excluded: set[str] = set()
         last_response: JSONResponse | None = None
@@ -151,6 +190,10 @@ class Router:
             try:
                 response = await upstream.call(body, trace_id, remaining)
             except ProviderCallError as exc:
+                if exc.error == "circuit_open":
+                    excluded.add(upstream.name)
+                    logger.info("circuit_open trace_id=%s provider=%s", trace_id, upstream.name)
+                    continue
                 last_error = exc
                 attempt += 1
                 if attempt == 1 and exc.error in FAILOVER_ERRORS:
@@ -180,7 +223,7 @@ class Router:
             raise last_error
         if last_response is not None:
             return last_response
-        raise ProviderCallError("upstream_unavailable", 503)
+        raise ProviderCallError("upstream_unavailable", 503, retry_after=1)
 
 
 def _capped(timeout: httpx.Timeout, budget: float) -> httpx.Timeout:

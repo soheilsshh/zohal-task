@@ -20,6 +20,7 @@ from starlette.responses import Response
 from app.api import router
 from app.limits import ProviderABudget, RedisGate, open_redis
 from app.providers import ProviderCallError, ProviderClient, build_client
+from app.resilience import Admission, Breaker
 from app.routing import Router, Upstream
 from app.schemas import ErrorResponse, ValidationDetail
 from app.settings import get_settings
@@ -75,13 +76,20 @@ async def lifespan(app: FastAPI):
             ("c", settings.provider_c_url),
         ):
             timeout = _provider_timeout(settings, name)
-            client = build_client(timeout)
+            max_inflight = getattr(settings, f"provider_{name}_max_inflight")
+            client = build_client(timeout, max_inflight)
             clients.append(client)
             upstreams.append(
                 Upstream(
                     ProviderClient(client, str(url), name=name),
-                    max_inflight=getattr(settings, f"provider_{name}_max_inflight"),
+                    max_inflight=max_inflight,
                     timeout=timeout,
+                    breaker=Breaker(
+                        name,
+                        failure_threshold=settings.circuit_failure_threshold,
+                        rate_limit_threshold=settings.circuit_rate_limit_threshold,
+                        open_seconds=settings.circuit_open_seconds,
+                    ),
                 )
             )
             logger.info("provider client opened name=%s id=%s url=%s", name, id(client), url)
@@ -93,6 +101,7 @@ async def lifespan(app: FastAPI):
             deadline_seconds=settings.deadline_seconds,
             min_attempt_seconds=settings.min_attempt_seconds,
             budget=ProviderABudget(gate),
+            admission=Admission(settings.admission_max_inflight),
         )
         yield
     finally:
@@ -104,8 +113,12 @@ async def lifespan(app: FastAPI):
             logger.info("redis closed")
 
 
-def _error_response(status_code: int, payload: ErrorResponse) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content=payload.model_dump())
+def _error_response(
+    status_code: int,
+    payload: ErrorResponse,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content=payload.model_dump(), headers=headers)
 
 
 def create_app() -> FastAPI:
@@ -114,8 +127,9 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description=(
             "Synchronous gateway. Swagger UI is this page. "
-            "POST /v1/process prefers provider A when its bucket has a token, "
-            "may fail over once, and replays a stored Idempotency-Key."
+            "POST /v1/process prefers provider A when its circuit admits it, "
+            "its bucket has a token, and a bulkhead slot is free. "
+            "It may fail over once, and it replays a stored Idempotency-Key."
         ),
         docs_url="/docs",
         redoc_url="/redoc",
@@ -167,7 +181,10 @@ def create_app() -> FastAPI:
     @application.exception_handler(ProviderCallError)
     async def provider_error(request: Request, exc: ProviderCallError) -> JSONResponse:
         payload = ErrorResponse(trace_id=_trace_id_from(request), error=exc.error)
-        return _error_response(exc.status_code, payload)
+        headers = None
+        if exc.retry_after is not None:
+            headers = {"Retry-After": str(exc.retry_after)}
+        return _error_response(exc.status_code, payload, headers)
 
     return application
 

@@ -100,7 +100,7 @@ async def once(
     try:
         response = await call()
     except ProviderCallError as exc:
-        if exc.error == "rate_limit_unavailable":
+        if exc.error in {"rate_limit_unavailable", "admission_rejected"}:
             await _release(store, key, trace_id)
             raise
         await _finish(store, key, _error_json(trace_id, exc), trace_id)

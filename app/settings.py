@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     provider_b_max_inflight: int = 20
     provider_c_max_inflight: int = 20
 
+    # Per process, like the bulkheads. A second replica has its own door
+    # and its own breakers. 120 in flight at about one second each is
+    # about 120 RPS through this process: concurrency ≈ RPS × latency.
+    admission_max_inflight: int = 120
+    circuit_failure_threshold: int = 5
+    circuit_rate_limit_threshold: int = 5
+    circuit_open_seconds: float = 20.0
+
     # Inside Compose the hostname is the service name, not localhost.
     redis_url: str = "redis://redis:6379/0"
     # Guesses until a benchmark measures A's 429 line. Capacity is the
