@@ -1,9 +1,8 @@
 """Choose a provider and allow one failover inside a deadline.
 
 In-flight caps live on this object. They are per process: another
-Uvicorn worker or another container has its own counters. Phase 5 does
-not move them to Redis; a later phase can, if more than one process
-must share the cap.
+Uvicorn worker or another container has its own counters. The shared
+limit is the Redis token bucket, and it is asked before A is called.
 """
 
 import asyncio
@@ -24,6 +23,12 @@ FAILOVER_STATUSES = frozenset({429, 502, 503, 504})
 FAILOVER_ERRORS = frozenset(
     {"upstream_timeout", "upstream_unavailable", "upstream_saturated"}
 )
+
+
+class OutboundBudget(Protocol):
+    """``take`` returns ``ok`` when A may be called, otherwise ``empty``."""
+
+    async def take(self, provider: str) -> str: ...
 
 
 class UpstreamCall(Protocol):
@@ -83,6 +88,7 @@ class Router:
         upstreams: list[Upstream],
         deadline_seconds: float,
         min_attempt_seconds: float,
+        budget: OutboundBudget | None = None,
     ) -> None:
         by_name = {upstream.name: upstream for upstream in upstreams}
         self._a = by_name["a"]
@@ -90,6 +96,7 @@ class Router:
         self._c = by_name["c"]
         self._deadline = deadline_seconds
         self._min_attempt = min_attempt_seconds
+        self._budget = budget
         self._prefer_b = True
 
     def choose(self, excluded: set[str]) -> Upstream | None:
@@ -109,7 +116,8 @@ class Router:
         last_response: JSONResponse | None = None
         last_error: ProviderCallError | None = None
 
-        for attempt in range(2):
+        attempt = 0
+        while attempt < 2:
             remaining = deadline - time.monotonic()
             if remaining < self._min_attempt:
                 logger.warning(
@@ -126,6 +134,12 @@ class Router:
                     ",".join(sorted(excluded)) or "-",
                 )
                 break
+            if upstream.name == "a" and self._budget is not None:
+                decision = await self._budget.take("a")
+                if decision != "ok":
+                    excluded.add("a")
+                    logger.info("bucket_empty trace_id=%s provider=a", trace_id)
+                    continue
             logger.info(
                 "attempt trace_id=%s n=%s provider=%s remaining_ms=%.1f inflight=%s",
                 trace_id,
@@ -138,7 +152,8 @@ class Router:
                 response = await upstream.call(body, trace_id, remaining)
             except ProviderCallError as exc:
                 last_error = exc
-                if attempt == 0 and exc.error in FAILOVER_ERRORS:
+                attempt += 1
+                if attempt == 1 and exc.error in FAILOVER_ERRORS:
                     excluded.add(upstream.name)
                     logger.warning(
                         "failover trace_id=%s from=%s reason=%s",
@@ -148,7 +163,8 @@ class Router:
                     )
                     continue
                 break
-            if attempt == 0 and response.status_code in FAILOVER_STATUSES:
+            attempt += 1
+            if attempt == 1 and response.status_code in FAILOVER_STATUSES:
                 excluded.add(upstream.name)
                 last_response = response
                 logger.warning(

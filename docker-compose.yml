@@ -1,10 +1,25 @@
 services:
+  redis:
+    image: redis:7.4-alpine
+    # No snapshot and no AOF. A restart drops the bucket and the
+    # idempotency keys. The API reaches this process as the hostname
+    # redis, which is not 127.0.0.1 inside the API container.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
   api:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
       # Docker Desktop on Windows often does not deliver file events from a
       # bind mount. Polling is what makes --reload see a save.

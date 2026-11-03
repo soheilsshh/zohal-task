@@ -18,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from app.api import router
+from app.limits import ProviderABudget, RedisGate, open_redis
 from app.providers import ProviderCallError, ProviderClient, build_client
 from app.routing import Router, Upstream
 from app.schemas import ErrorResponse, ValidationDetail
@@ -65,34 +66,42 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.settings = settings
     clients: list[httpx.AsyncClient] = []
-    upstreams: list[Upstream] = []
-    for name, url in (
-        ("a", settings.provider_a_url),
-        ("b", settings.provider_b_url),
-        ("c", settings.provider_c_url),
-    ):
-        timeout = _provider_timeout(settings, name)
-        client = build_client(timeout)
-        clients.append(client)
-        upstreams.append(
-            Upstream(
-                ProviderClient(client, str(url), name=name),
-                max_inflight=getattr(settings, f"provider_{name}_max_inflight"),
-                timeout=timeout,
-            )
-        )
-        logger.info("provider client opened name=%s id=%s url=%s", name, id(client), url)
-    app.state.router = Router(
-        upstreams,
-        deadline_seconds=settings.deadline_seconds,
-        min_attempt_seconds=settings.min_attempt_seconds,
-    )
+    gate: RedisGate | None = None
     try:
+        upstreams: list[Upstream] = []
+        for name, url in (
+            ("a", settings.provider_a_url),
+            ("b", settings.provider_b_url),
+            ("c", settings.provider_c_url),
+        ):
+            timeout = _provider_timeout(settings, name)
+            client = build_client(timeout)
+            clients.append(client)
+            upstreams.append(
+                Upstream(
+                    ProviderClient(client, str(url), name=name),
+                    max_inflight=getattr(settings, f"provider_{name}_max_inflight"),
+                    timeout=timeout,
+                )
+            )
+            logger.info("provider client opened name=%s id=%s url=%s", name, id(client), url)
+        gate = RedisGate(open_redis(settings.redis_url), settings)
+        app.state.gate = gate
+        await gate.ping()
+        app.state.router = Router(
+            upstreams,
+            deadline_seconds=settings.deadline_seconds,
+            min_attempt_seconds=settings.min_attempt_seconds,
+            budget=ProviderABudget(gate),
+        )
         yield
     finally:
         for client in clients:
             await client.aclose()
             logger.info("provider client closed id=%s", id(client))
+        if gate is not None:
+            await gate.aclose()
+            logger.info("redis closed")
 
 
 def _error_response(status_code: int, payload: ErrorResponse) -> JSONResponse:
@@ -105,7 +114,8 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description=(
             "Synchronous gateway. Swagger UI is this page. "
-            "POST /v1/process prefers provider A and may fail over once."
+            "POST /v1/process prefers provider A when its bucket has a token, "
+            "may fail over once, and replays a stored Idempotency-Key."
         ),
         docs_url="/docs",
         redoc_url="/redoc",

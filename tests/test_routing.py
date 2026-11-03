@@ -42,12 +42,13 @@ def make_router(
     c: Scripted,
     deadline: float = 3.0,
     caps: tuple[int, int, int] = (100, 100, 100),
+    budget: object | None = None,
 ) -> tuple[Router, list[Upstream]]:
     timeout = httpx.Timeout(1.0)
     upstreams = [
         Upstream(client, cap, timeout) for client, cap in zip((a, b, c), caps, strict=True)
     ]
-    return Router(upstreams, deadline, min_attempt_seconds=0.05), upstreams
+    return Router(upstreams, deadline, min_attempt_seconds=0.05, budget=budget), upstreams
 
 
 def body_of(response: JSONResponse) -> dict:
@@ -152,3 +153,38 @@ async def test_b_starts_only_after_a_has_finished() -> None:
     await router.execute({}, "trace-7")
 
     assert seen == [0]
+
+
+class _Budget:
+    def __init__(self, decision: str) -> None:
+        self._decision = decision
+
+    async def take(self, provider: str) -> str:
+        if self._decision == "down":
+            raise ProviderCallError("rate_limit_unavailable", 503)
+        return self._decision
+
+
+async def test_empty_bucket_skips_a_and_calls_b_once() -> None:
+    a, b, c = Scripted("a", [200]), Scripted("b", [200]), Scripted("c", [200])
+    router, _ = make_router(a, b, c, budget=_Budget("empty"))
+
+    response = await router.execute({}, "trace-bucket")
+
+    assert body_of(response)["provider"] == "b"
+    assert a.calls == []
+    assert b.calls == ["trace-bucket"]
+    assert c.calls == []
+
+
+async def test_redis_down_rejects_before_any_provider() -> None:
+    a, b, c = Scripted("a", [200]), Scripted("b", [200]), Scripted("c", [200])
+    router, _ = make_router(a, b, c, budget=_Budget("down"))
+
+    with pytest.raises(ProviderCallError) as caught:
+        await router.execute({}, "trace-redis")
+
+    assert caught.value.error == "rate_limit_unavailable"
+    assert a.calls == []
+    assert b.calls == []
+    assert c.calls == []

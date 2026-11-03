@@ -4,11 +4,21 @@
 This module only decides what each route returns.
 """
 
-from fastapi import APIRouter, Request
+import logging
+import re
+from typing import Annotated
+
+from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from app.idempotency import IdempotencyInProgress, InvalidIdempotencyKey, normalize_key, once
+from app.limits import RedisGate
 from app.routing import Router
 from app.schemas import ErrorResponse, ProcessRequest, ProviderResult
+
+logger = logging.getLogger("gateway")
+
+_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 router = APIRouter()
 
@@ -35,19 +45,71 @@ async def healthz() -> dict[str, str]:
     tags=["process"],
     responses={
         200: {"model": ProviderResult},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
         502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
         504: {"model": ErrorResponse},
     },
 )
-async def process(body: ProcessRequest, request: Request) -> JSONResponse:
-    """Prefer provider A. One timeout, connect error, 429, 502, 503, or 504 may try B or C.
+async def process(
+    body: ProcessRequest,
+    request: Request,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            description="Repeat of this key returns the stored response and does not call a provider.",
+        ),
+    ] = None,
+    x_client_id: Annotated[
+        str | None,
+        Header(alias="X-Client-Id", description="Caller identity for the inbound limit. Falls back to the peer address."),
+    ] = None,
+) -> JSONResponse:
+    """Prefer A when its bucket has a token. One failover may try B or C.
 
-    The second attempt runs only inside the deadline. A 500 from a
-    provider is returned as-is. Network failure after the attempts are
-    exhausted becomes this service's error body.
+    The same ``Idempotency-Key`` returns the first response. Redis
+    errors on the bucket, the inbound counter, or the key reject the
+    call before a provider is contacted.
     """
+    trace_id = request.state.trace_id
+    try:
+        key = normalize_key(idempotency_key)
+    except InvalidIdempotencyKey:
+        payload = ErrorResponse(trace_id=trace_id, error="invalid_idempotency_key")
+        return JSONResponse(status_code=422, content=payload.model_dump())
+
+    gate: RedisGate = request.app.state.gate
+    host = request.client.host if request.client is not None else None
+    identity = _client_identity(x_client_id, host)
+    if not await gate.allow_inbound(identity):
+        logger.info("inbound_limited trace_id=%s client=%s", trace_id, identity)
+        payload = ErrorResponse(trace_id=trace_id, error="rate_limited")
+        retry_after = request.app.state.settings.inbound_window_seconds
+        return JSONResponse(
+            status_code=429,
+            content=payload.model_dump(),
+            headers={"Retry-After": str(retry_after)},
+        )
+
     gateway: Router = request.app.state.router
-    return await gateway.execute(
-        body.model_dump(exclude_none=True),
-        request.state.trace_id,
-    )
+
+    async def call() -> JSONResponse:
+        return await gateway.execute(body.model_dump(exclude_none=True), trace_id)
+
+    try:
+        return await once(gate, key, trace_id, call)
+    except IdempotencyInProgress:
+        payload = ErrorResponse(trace_id=trace_id, error="idempotency_in_progress")
+        return JSONResponse(status_code=409, content=payload.model_dump())
+
+
+def _client_identity(client_id: str | None, host: str | None) -> str:
+    """Prefer a declared id. An address is the fallback, and a shared NAT shares that limit."""
+    if client_id is not None and _IDENTITY.fullmatch(client_id.strip()):
+        return "id:" + client_id.strip()
+    if host is not None and _IDENTITY.fullmatch(host.strip()):
+        return "ip:" + host.strip()
+    return "ip:unknown"

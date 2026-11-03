@@ -1,9 +1,9 @@
 """Process settings.
 
 Environment variables override the env file. The env file overrides
-the defaults below. A call prefers provider A. One failure on the
-failover list may try B or C inside the deadline. Nothing calls all
-three at once.
+the defaults below. A call prefers provider A when the shared token
+bucket has a token. One failure on the failover list may try B or C
+inside the deadline. Nothing calls all three at once.
 """
 
 from functools import lru_cache
@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     provider_a_max_inflight: int = 100
     provider_b_max_inflight: int = 20
     provider_c_max_inflight: int = 20
+
+    # Inside Compose the hostname is the service name, not localhost.
+    redis_url: str = "redis://redis:6379/0"
+    # Guesses until a benchmark measures A's 429 line. Capacity is the
+    # burst. Refill is the sustained rate. One quiet minute refills a
+    # full bucket either way, because an expired key starts full.
+    provider_a_bucket_capacity: float = 20
+    provider_a_refill_per_second: float = 10
+    # Fixed window, per caller. A window boundary can allow this twice.
+    inbound_limit: int = 100
+    inbound_window_seconds: int = 1
+    idempotency_ttl_seconds: int = 86400
+    idempotency_pending_seconds: int = 30
 
 
 @lru_cache(maxsize=1)
