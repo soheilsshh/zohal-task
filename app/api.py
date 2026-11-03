@@ -12,12 +12,14 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Header, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from app.audit import audit_message, error_class_of, provider_of, response_json
 from app.idempotency import IdempotencyInProgress, InvalidIdempotencyKey, normalize_key, once
 from app.limits import RedisGate
+from app.metrics import METRICS_MEDIA_TYPE, record_publish_failure, render_metrics
 from app.providers import ProviderCallError
+from app.ready import broker_ready
 from app.routing import Router
 from app.schemas import ErrorResponse, ProcessRequest, ProviderResult
 from app.tasks import publish_audit
@@ -40,10 +42,28 @@ async def healthz() -> dict[str, str]:
     """Process liveness.
 
     Answers whether this process can serve HTTP. It must not call a
-    provider, Redis, or a database. Dependency checks belong on a
-    readiness route, which does not exist yet.
+    provider, Redis, the broker, or a database. Those checks are
+    ``/readyz``.
     """
     return {"status": "ok"}
+
+
+@router.get("/readyz", tags=["ops"])
+async def readyz(request: Request) -> JSONResponse:
+    """Redis and the broker. Does not call provider A, B, or C."""
+    gate: RedisGate = request.app.state.gate
+    redis_ok = await gate.ready()
+    broker_ok = await asyncio.to_thread(broker_ready, request.app.state.settings.celery_broker_url)
+    body = {"status": "ok" if redis_ok and broker_ok else "unavailable", "redis": redis_ok, "broker": broker_ok}
+    if redis_ok and broker_ok:
+        return JSONResponse(status_code=200, content=body)
+    return JSONResponse(status_code=503, content=body)
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Prometheus text. Scrapes are not counted as gateway traffic."""
+    return Response(content=render_metrics(), media_type=METRICS_MEDIA_TYPE)
 
 
 @router.post(
@@ -155,6 +175,7 @@ async def process(
         try:
             await asyncio.to_thread(publish_audit, message)
         except Exception as exc:
+            record_publish_failure()
             logger.error(
                 "audit_publish_failed trace_id=%s error=%s",
                 trace_id,

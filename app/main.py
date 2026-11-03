@@ -6,6 +6,7 @@ Uvicorn loads the module-level ``app`` object (``app.main:app``).
 
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -19,6 +20,8 @@ from starlette.responses import Response
 
 from app.api import router
 from app.limits import ProviderABudget, RedisGate, open_redis
+from app.log import configure_logging, trace_id
+from app.metrics import record_http, set_admission, set_circuit, set_inflight
 from app.providers import ProviderCallError, ProviderClient, build_client
 from app.resilience import Admission, Breaker
 from app.routing import Router, Upstream
@@ -27,9 +30,8 @@ from app.settings import get_settings
 
 logger = logging.getLogger("gateway")
 
-# A trace id is written into logs later. Reject characters that would
-# split a log line or a header, and cap the length a client can force us
-# to store.
+# A trace id is written into logs. Reject characters that would split a
+# JSON line or a header, and cap the length a client can force us to store.
 _TRACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 _HTTP_ERRORS = {
@@ -51,19 +53,12 @@ def resolve_trace_id(raw: str | None) -> str:
     return uuid4().hex
 
 
-def _configure_logging() -> None:
-    if logger.handlers:
-        return
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+_SKIP_METRICS = {"/healthz", "/readyz", "/metrics"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _configure_logging()
+    configure_logging()
     settings = get_settings()
     app.state.settings = settings
     clients: list[httpx.AsyncClient] = []
@@ -93,6 +88,10 @@ async def lifespan(app: FastAPI):
                 )
             )
             logger.info("provider client opened name=%s id=%s url=%s", name, id(client), url)
+        for upstream in upstreams:
+            set_inflight(upstream.name, 0)
+            set_circuit(upstream.name, upstream.breaker.state)
+        set_admission(0)
         gate = RedisGate(open_redis(settings.redis_url), settings)
         app.state.gate = gate
         await gate.ping()
@@ -144,9 +143,18 @@ def create_app() -> FastAPI:
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         request.state.trace_id = resolve_trace_id(request.headers.get("x-request-id"))
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.trace_id
-        return response
+        token = trace_id.set(request.state.trace_id)
+        started = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            response.headers["X-Request-ID"] = request.state.trace_id
+            return response
+        finally:
+            if request.url.path not in _SKIP_METRICS:
+                record_http(status, time.perf_counter() - started)
+            trace_id.reset(token)
 
     @application.exception_handler(RequestValidationError)
     async def validation_error(

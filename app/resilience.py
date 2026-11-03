@@ -14,6 +14,7 @@ import logging
 import time
 from collections.abc import Callable
 
+from app.metrics import record_admission_rejected, set_admission, set_circuit
 from app.providers import ProviderCallError
 
 logger = logging.getLogger("gateway")
@@ -128,6 +129,7 @@ class Breaker:
             return
         logger.warning("circuit provider=%s from=%s to=%s", self.name, self.state, new)
         self.state = new
+        set_circuit(self.name, new)
 
 
 class Admission:
@@ -145,8 +147,11 @@ class Admission:
 
     def enter(self) -> None:
         if self.inflight >= self.max_inflight:
+            record_admission_rejected()
             raise ProviderCallError("admission_rejected", 429, retry_after=self._retry_after)
         self.inflight += 1
+        set_admission(self.inflight)
 
     def leave(self) -> None:
         self.inflight -= 1
+        set_admission(self.inflight)

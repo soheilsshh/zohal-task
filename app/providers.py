@@ -12,7 +12,16 @@ from typing import Any
 import httpx
 from fastapi.responses import JSONResponse
 
+from app.metrics import record_provider
+
 logger = logging.getLogger("gateway")
+
+
+def provider_event_is_warning(status: str, error: str | None) -> bool:
+    """A 5xx is the provider's answer. Log it with the status. Do not treat it as our bug."""
+    if error is not None:
+        return True
+    return status.isdigit() and int(status) >= 500
 
 
 class ProviderCallError(Exception):
@@ -60,8 +69,10 @@ class ProviderClient:
 
     def _log(self, trace_id: str, status: str, started: float, error: str | None = None) -> None:
         latency_ms = (time.perf_counter() - started) * 1000
+        record_provider(self.name, status)
+        log = logger.warning if provider_event_is_warning(status, error) else logger.info
         if error is None:
-            logger.info(
+            log(
                 "provider_call trace_id=%s provider=%s status=%s latency_ms=%.1f",
                 trace_id,
                 self.name,
@@ -69,7 +80,7 @@ class ProviderClient:
                 latency_ms,
             )
             return
-        logger.warning(
+        log(
             "provider_call trace_id=%s provider=%s status=%s latency_ms=%.1f error=%s",
             trace_id,
             self.name,

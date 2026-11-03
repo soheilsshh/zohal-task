@@ -123,6 +123,14 @@ class RedisGate(ResultStore):
             return
         logger.info("redis opened target=%s", redis_target(self._settings.redis_url))
 
+    async def ready(self) -> bool:
+        """Whether Redis answers. Used by readiness, not by liveness."""
+        try:
+            await self._redis.ping()
+        except RedisError:
+            return False
+        return True
+
     async def aclose(self) -> None:
         await self._redis.aclose()
 

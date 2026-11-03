@@ -13,6 +13,7 @@ from celery.signals import worker_process_init, worker_process_shutdown
 from app.audit import create_sync_engine, insert_audit_row
 from app.bodies import insert_body, open_bodies
 from app.celery_app import celery
+from app.log import configure_logging, trace_id
 from app.settings import get_settings
 
 logger = logging.getLogger("gateway")
@@ -25,6 +26,7 @@ _bodies = None
 @worker_process_init.connect
 def _open_database(**_kwargs) -> None:
     global _engine, _mongo, _bodies
+    configure_logging()
     settings = get_settings()
     _engine = create_sync_engine(settings.database_url_sync)
     _mongo, _bodies = open_bodies(settings.mongo_url)
@@ -56,13 +58,17 @@ def write_audit(self, message: dict) -> None:
     """Insert the row, then the bodies. Raise to retry. Do not call a provider."""
     if _engine is None or _bodies is None:
         raise RuntimeError("audit worker database is not open")
-    logger.info(
-        "audit_task trace_id=%s retry=%s",
-        message.get("trace_id"),
-        self.request.retries,
-    )
-    insert_audit_row(_engine, message)
-    insert_body(_bodies, message)
+    token = trace_id.set(message.get("trace_id"))
+    try:
+        logger.info(
+            "audit_task trace_id=%s retry=%s",
+            message.get("trace_id"),
+            self.request.retries,
+        )
+        insert_audit_row(_engine, message)
+        insert_body(_bodies, message)
+    finally:
+        trace_id.reset(token)
 
 
 def publish_audit(message: dict) -> None:

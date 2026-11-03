@@ -15,6 +15,7 @@ from typing import Any, Protocol
 import httpx
 from fastapi.responses import JSONResponse
 
+from app.metrics import record_provider, set_inflight
 from app.providers import ProviderCallError
 from app.resilience import Admission, Breaker
 
@@ -73,6 +74,7 @@ class Upstream:
         if not self.breaker.acquire():
             raise ProviderCallError("circuit_open", 503)
         self.inflight += 1
+        set_inflight(self.name, self.inflight)
         started = time.perf_counter()
         status_code: int | None = None
         error: str | None = None
@@ -83,6 +85,7 @@ class Upstream:
                     timeout=budget,
                 )
             except TimeoutError as exc:
+                record_provider(self.name, "timeout")
                 logger.warning(
                     "provider_call trace_id=%s provider=%s status=timeout latency_ms=%.1f error=Deadline",
                     trace_id,
@@ -99,6 +102,7 @@ class Upstream:
             raise
         finally:
             self.inflight -= 1
+            set_inflight(self.name, self.inflight)
             self.breaker.observe(status_code, error)
 
 
