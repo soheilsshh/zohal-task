@@ -59,9 +59,10 @@ class Settings(BaseSettings):
 
     # Inside Compose the hostname is the service name, not localhost.
     redis_url: str = "redis://redis:6379/0"
-    # Guesses until a benchmark measures A's 429 line. Capacity is the
-    # burst. Refill is the sustained rate. One quiet minute refills a
-    # full bucket either way, because an expired key starts full.
+    # The 2026-11-03 closed-loop run stayed near 11 successful requests
+    # per second and never showed A's own HTTP 429. Capacity and refill
+    # are still a headroom guess, not a measured 429 line. An expired
+    # idle key starts full.
     provider_a_bucket_capacity: float = 20
     provider_a_refill_per_second: float = 10
     # Fixed window, per caller. A window boundary can allow this twice.

@@ -1,8 +1,8 @@
-"""Outbound call to provider A.
+"""Outbound call to one provider.
 
-One ``httpx.AsyncClient`` is created with the process and closed with it.
-A route must not construct a client. Doing that would pay a new
-connection on every request and defeat keepalive.
+One ``httpx.AsyncClient`` per provider is created with the process and
+closed with it. A route must not construct a client. Doing that would
+pay a new connection on every request and defeat keepalive.
 """
 
 import logging

@@ -120,6 +120,17 @@ services:
         condition: service_healthy
       mongo:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app:celery", "inspect", "ping", "-t", "5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+  locust:
+    image: locustio/locust:2.32.4
+    profiles: ["bench"]
+    volumes:
+      - ./bench/locustfile.py:/mnt/locust/locustfile.py:ro
 
 volumes:
   pgdata:
