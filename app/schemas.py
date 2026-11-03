@@ -1,25 +1,46 @@
-"""Public request, response, and error bodies.
+"""Public request and error bodies, plus the provider result we document.
 
-These models are the contract a client can depend on. Phase 3 replaces
-the echoed object with the real provider fields. The error model stays.
+``ProcessRequest`` matches provider A's published schema. The success
+body is not re-validated on the way out: A owns that JSON, and a new
+field from A must not become a 500 in our process.
 """
 
 from typing import Any
 
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class ProcessRequest(RootModel[dict[str, Any]]):
-    """One JSON object.
+class ProcessRequest(BaseModel):
+    """JSON object forwarded to provider A.
 
-    A root array or a JSON scalar is rejected. There is no field list
-    yet because the provider contract has not been observed.
+    ``payload`` is optional. When it is present it must be an object.
+    Other top-level keys are rejected here so a typo is not silently
+    dropped the way A drops unknown keys.
     """
 
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"payload": {"order_id": "1001"}}},
+    )
 
-class ProcessResponse(BaseModel):
-    trace_id: str
-    body: dict[str, Any]
+    payload: dict[str, Any] | None = Field(
+        default=None,
+        description="Object provider A copies into its echo field.",
+        examples=[{"order_id": "1001"}],
+    )
+
+
+class ProviderResult(BaseModel):
+    """Shape observed from provider A on HTTP 200. Extra keys are allowed."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    status: str
+    provider: str
+    echo: dict[str, Any]
+    latency_ms: float
+    request_id: str
 
 
 class ValidationDetail(BaseModel):
