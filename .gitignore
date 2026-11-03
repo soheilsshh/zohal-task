@@ -1,0 +1,87 @@
+# Interview materials and personal study notes (local only)
+doc/Task.md
+doc/INTERVIEW_STUDY_GUIDE.md
+doc/phase.md
+doc/LEARNING.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test, type check, coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+secrets/
+
+# Logs and local runtime
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# Docker / local data volumes
+pgdata/
+mongo-data/
+redis-data/
+rabbitmq-data/
+prometheus-data/
+grafana-data/
+
+# Benchmark output
+benchmarks/results/
+*.bench.json
+k6-results/
+load-test-results/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Docker Desktop on Windows often does not deliver file events from a
+      # bind mount. Polling is what makes --reload see a save.
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      - ./app:/srv/app/app
+    # Dev command. The image CMD serves without a reloader.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /srv/app/app
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
