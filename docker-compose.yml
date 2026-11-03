@@ -44,6 +44,18 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+  mongo:
+    image: mongo:7
+    # No auth and no published port. The worker reaches this process as
+    # the hostname mongo. The API does not open a connection.
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
   api:
     build:
       context: .
@@ -106,6 +118,9 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      mongo:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  mongodata:

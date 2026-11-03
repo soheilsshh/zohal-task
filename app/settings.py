@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     database_url_sync: str = "postgresql+psycopg://zohal:zohal@postgres:5432/zohal"
     # Not guest. RabbitMQ refuses the guest user from another container.
     celery_broker_url: str = "amqp://zohal:zohal@rabbitmq:5672//"
+    # The worker writes bodies here. The API process does not open this connection.
+    # No password: the port is not published, and this is the local lab.
+    mongo_url: str = "mongodb://mongo:27017"
 
 
 @lru_cache(maxsize=1)

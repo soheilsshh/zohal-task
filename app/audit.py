@@ -2,9 +2,10 @@
 
 The API publishes the row. The Celery worker inserts it. A duplicate
 ``trace_id`` is ignored, so a redelivered message does not create a
-second row. The body is not stored here.
+second row. Bodies ride on the message for MongoDB. They are not columns.
 """
 
+import json
 import logging
 import time
 from datetime import datetime
@@ -15,6 +16,9 @@ from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 logger = logging.getLogger("gateway")
+
+# A larger body is not put on the queue. The message keeps the size only.
+BODY_CAP_BYTES = 16 * 1024
 
 
 class Base(DeclarativeBase):
@@ -41,6 +45,15 @@ def create_sync_engine(url: str):
     return create_engine(url, pool_size=2, max_overflow=0, pool_pre_ping=True)
 
 
+def capped_json(value: object) -> dict:
+    """Keep a small JSON value. A value over the cap contributes its size and nothing else."""
+    encoded = json.dumps(value, separators=(",", ":"), default=str).encode("utf-8")
+    size = len(encoded)
+    if size > BODY_CAP_BYTES:
+        return {"dropped": True, "bytes": size}
+    return {"dropped": False, "bytes": size, "content": value}
+
+
 def audit_message(
     *,
     trace_id: str,
@@ -51,6 +64,8 @@ def audit_message(
     latency_ms: float,
     attempts: list[dict],
     error_class: str | None,
+    request_body: object,
+    response_body: object,
 ) -> dict:
     """JSON-safe payload. The worker is a different process and cannot share objects."""
     return {
@@ -62,6 +77,8 @@ def audit_message(
         "latency_ms": round(latency_ms, 1),
         "attempts": attempts,
         "error_class": error_class,
+        "request": capped_json(request_body),
+        "response": capped_json(response_body),
     }
 
 
@@ -84,10 +101,14 @@ def insert_audit_row(engine, message: dict) -> None:
             error_class=message["error_class"],
         )
         .on_conflict_do_nothing(index_elements=["trace_id"])
+        .returning(AuditRequest.trace_id)
     )
     with Session(engine) as session:
-        session.execute(statement)
+        inserted = session.execute(statement).first() is not None
         session.commit()
+    if not inserted:
+        logger.info("audit_insert_exists trace_id=%s", message["trace_id"])
+        return
     logger.info(
         "audit_insert trace_id=%s status=%s provider=%s latency_ms=%s insert_ms=%.1f",
         message["trace_id"],
@@ -122,12 +143,15 @@ def error_class_of(status: int, response: JSONResponse | None, raised: str | Non
     return f"upstream_{status}"
 
 
+def response_json(response: JSONResponse | None) -> object:
+    """The JSON we returned, or ``None`` when the handler built the body later."""
+    return _body(response)
+
+
 def _body(response: JSONResponse | None) -> object:
     if response is None:
         return None
     try:
-        import json
-
         return json.loads(response.body)
     except (ValueError, TypeError):
         return None

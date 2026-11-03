@@ -14,7 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from app.audit import audit_message, error_class_of, provider_of
+from app.audit import audit_message, error_class_of, provider_of, response_json
 from app.idempotency import IdempotencyInProgress, InvalidIdempotencyKey, normalize_key, once
 from app.limits import RedisGate
 from app.providers import ProviderCallError
@@ -77,7 +77,8 @@ async def process(
     """Prefer A when its bucket has a token. One failover may try B or C.
 
     The audit message is published before the response is sent. The
-    worker inserts the row. This request does not wait for PostgreSQL.
+    worker inserts the row, then the bodies. This request does not wait
+    for PostgreSQL or MongoDB.
     The same ``Idempotency-Key`` returns the stored response and does
     not call a provider.
     """
@@ -88,6 +89,7 @@ async def process(
     status = 500
     raised: str | None = None
     response: JSONResponse | None = None
+    error_body: dict | None = None
     try:
         try:
             key = normalize_key(idempotency_key)
@@ -135,6 +137,7 @@ async def process(
     except ProviderCallError as exc:
         status = exc.status_code
         raised = exc.error
+        error_body = ErrorResponse(trace_id=trace_id, error=exc.error).model_dump()
         raise
     finally:
         message = audit_message(
@@ -146,6 +149,8 @@ async def process(
             latency_ms=(time.perf_counter() - started) * 1000,
             attempts=list(trail),
             error_class=error_class_of(status, response, raised),
+            request_body=body.model_dump(),
+            response_body=response_json(response) if response is not None else error_body,
         )
         try:
             await asyncio.to_thread(publish_audit, message)
