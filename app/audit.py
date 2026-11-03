@@ -82,13 +82,9 @@ def audit_message(
     }
 
 
-def insert_audit_row(engine, message: dict) -> None:
-    """Insert one row and commit. The caller retries when this raises.
-
-    ``ON CONFLICT DO NOTHING`` makes a second delivery of the same trace id a success.
-    """
-    started = time.perf_counter()
-    statement = (
+def audit_insert_statement(message: dict):
+    """One insert. A repeated ``trace_id`` changes nothing and returns no row."""
+    return (
         insert(AuditRequest)
         .values(
             trace_id=message["trace_id"],
@@ -103,6 +99,15 @@ def insert_audit_row(engine, message: dict) -> None:
         .on_conflict_do_nothing(index_elements=["trace_id"])
         .returning(AuditRequest.trace_id)
     )
+
+
+def insert_audit_row(engine, message: dict) -> None:
+    """Insert one row and commit. The caller retries when this raises.
+
+    ``ON CONFLICT DO NOTHING`` makes a second delivery of the same trace id a success.
+    """
+    started = time.perf_counter()
+    statement = audit_insert_statement(message)
     with Session(engine) as session:
         inserted = session.execute(statement).first() is not None
         session.commit()

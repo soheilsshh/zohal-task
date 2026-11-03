@@ -182,6 +182,18 @@ class _Budget:
         return self._decision
 
 
+async def test_prefers_a_when_the_bucket_allows_it() -> None:
+    a, b, c = Scripted("a", [200]), Scripted("b", [200]), Scripted("c", [200])
+    router, _ = make_router(a, b, c, budget=_Budget("ok"))
+
+    response = await router.execute({}, "trace-token")
+
+    assert body_of(response)["provider"] == "a"
+    assert a.calls == ["trace-token"]
+    assert b.calls == []
+    assert c.calls == []
+
+
 async def test_empty_bucket_skips_a_and_calls_b_once() -> None:
     a, b, c = Scripted("a", [200]), Scripted("b", [200]), Scripted("c", [200])
     router, _ = make_router(a, b, c, budget=_Budget("empty"))
